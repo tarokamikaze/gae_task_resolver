@@ -9,6 +9,11 @@ import (
 	"cloud.google.com/go/datastore"
 	"os"
 	"google.golang.org/api/iterator"
+	"golang.org/x/sync/errgroup"
+	"io/ioutil"
+	"encoding/json"
+	"math/rand"
+	"time"
 )
 
 const (
@@ -25,12 +30,14 @@ type (
 	}
 )
 
-var mu = new(sync.Mutex)
+var getMu = new(sync.Mutex)
 
 func main() {
 
 	http.HandleFunc("/get", GetHandler)
+	http.HandleFunc("/add", AddHandler)
 	http.HandleFunc("/finished", FinishedHandler)
+	http.HandleFunc("/state", StateHandler)
 
 	// health check
 	healthCheckHandler := func(w http.ResponseWriter, r *http.Request) {
@@ -49,8 +56,8 @@ func GetHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	mu.Lock()
-	defer mu.Unlock()
+	getMu.Lock()
+	defer getMu.Unlock()
 	item, err := getItem(ctx, cli)
 	if err != nil {
 		if err == iterator.Done {
@@ -71,16 +78,67 @@ func GetHandler(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusOK)
 	fmt.Fprint(w, item.ID)
 }
-func FinishedHandler(w http.ResponseWriter, r *http.Request) {
+func StateHandler(w http.ResponseWriter, r *http.Request) {
 	ctx := appengine.NewContext(r)
-
-	vals, ok := r.URL.Query()["id"]
-	if !ok {
-		http.Error(w, fmt.Sprintf("id is required"), http.StatusInternalServerError)
+	cli, err := datastore.NewClient(ctx, os.Getenv("GCLOUD_PROJECT"))
+	if err != nil {
+		http.Error(w, fmt.Sprintf("An error was occured: %v", err), http.StatusInternalServerError)
 		return
 	}
-	id := vals[0]
-	if id == "" {
+	states := map[int]string{
+		stNone:  "none",
+		stDoing: "doing",
+		stDone:  "done",
+	}
+	counts := map[int]int{}
+	mu := new(sync.Mutex)
+	eg := errgroup.Group{}
+	egHandler := func(state int, str string) func() error {
+		return func() error {
+			q := datastore.NewQuery("Item").
+				Filter("State = ", state).
+				KeysOnly()
+
+			keys, err := cli.GetAll(ctx, q, nil)
+			if err != nil {
+				return err
+			}
+			mu.Lock()
+			defer mu.Unlock()
+			counts[state] = len(keys)
+			return nil
+		}
+	}
+	for s, v := range states {
+		eg.Go(egHandler(s, v))
+	}
+	err = eg.Wait()
+	if err != nil {
+		http.Error(w, fmt.Sprintf("An error was occured: %v", err), http.StatusInternalServerError)
+		return
+	}
+
+	res := ""
+	for i := 0; i <= stDone; i++ {
+		v := states[i]
+		cnt := counts[i]
+		res += fmt.Sprintf(" %s:%d", v, cnt)
+	}
+
+	w.WriteHeader(http.StatusOK)
+	fmt.Fprint(w, res)
+}
+func AddHandler(w http.ResponseWriter, r *http.Request) {
+	ctx := appengine.NewContext(r)
+
+	body, _ := ioutil.ReadAll(r.Body)
+	item := &Item{}
+	err := json.Unmarshal(body, item)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	if item.ID == "" {
 		http.Error(w, fmt.Sprintf("id is required"), http.StatusInternalServerError)
 		return
 	}
@@ -91,8 +149,45 @@ func FinishedHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	key := datastore.NameKey("Item", id, nil)
+	key := datastore.NameKey("Item", item.ID, nil)
+	if err := cli.Get(ctx, key, item); err == nil {
+		http.Error(w, fmt.Sprintf("the item has already exists: %s", item.ID), http.StatusInternalServerError)
+		return
+	}
+
+	rand.Seed(time.Now().UnixNano())
+	item.State = stNone
+	item.Score = rand.Intn(1000000)
+	if _, err := cli.Put(ctx, key, item); err != nil {
+		http.Error(w, fmt.Sprintf("An error was occured: %v", err), http.StatusInternalServerError)
+		return
+	}
+
+	w.WriteHeader(http.StatusOK)
+	fmt.Fprint(w, item.ID)
+}
+func FinishedHandler(w http.ResponseWriter, r *http.Request) {
+	ctx := appengine.NewContext(r)
+
+	body, _ := ioutil.ReadAll(r.Body)
 	item := &Item{}
+	err := json.Unmarshal(body, item)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	if item.ID == "" {
+		http.Error(w, fmt.Sprintf("id is required"), http.StatusInternalServerError)
+		return
+	}
+
+	cli, err := datastore.NewClient(ctx, os.Getenv("GCLOUD_PROJECT"))
+	if err != nil {
+		http.Error(w, fmt.Sprintf("An error was occured: %v", err), http.StatusInternalServerError)
+		return
+	}
+
+	key := datastore.NameKey("Item", item.ID, nil)
 	if err := cli.Get(ctx, key, item); err != nil {
 		http.Error(w, fmt.Sprintf("An error was occured: %v", err), http.StatusInternalServerError)
 		return
