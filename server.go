@@ -31,8 +31,18 @@ type (
 )
 
 var getMu = new(sync.Mutex)
+var cli = &datastore.Client{}
 
 func main() {
+
+	ctx := context.Background()
+	cl, err := datastore.NewClient(ctx, os.Getenv("GCLOUD_PROJECT"))
+	if err != nil {
+		println(err.Error())
+		return
+	}
+	cli = cl
+	defer cli.Close()
 
 	http.HandleFunc("/get", GetHandler)
 	http.HandleFunc("/add", AddHandler)
@@ -50,11 +60,6 @@ func main() {
 }
 func GetHandler(w http.ResponseWriter, r *http.Request) {
 	ctx := appengine.NewContext(r)
-	cli, err := datastore.NewClient(ctx, os.Getenv("GCLOUD_PROJECT"))
-	if err != nil {
-		http.Error(w, fmt.Sprintf("An error was occured: %v", err), http.StatusInternalServerError)
-		return
-	}
 
 	getMu.Lock()
 	defer getMu.Unlock()
@@ -80,11 +85,6 @@ func GetHandler(w http.ResponseWriter, r *http.Request) {
 }
 func StateHandler(w http.ResponseWriter, r *http.Request) {
 	ctx := appengine.NewContext(r)
-	cli, err := datastore.NewClient(ctx, os.Getenv("GCLOUD_PROJECT"))
-	if err != nil {
-		http.Error(w, fmt.Sprintf("An error was occured: %v", err), http.StatusInternalServerError)
-		return
-	}
 	states := map[int]string{
 		stNone:  "none",
 		stDoing: "doing",
@@ -99,20 +99,20 @@ func StateHandler(w http.ResponseWriter, r *http.Request) {
 				Filter("State = ", state).
 				KeysOnly()
 
-			keys, err := cli.GetAll(ctx, q, nil)
+			cnt, err := cli.Count(ctx, q)
 			if err != nil {
 				return err
 			}
 			mu.Lock()
 			defer mu.Unlock()
-			counts[state] = len(keys)
+			counts[state] = cnt
 			return nil
 		}
 	}
 	for s, v := range states {
 		eg.Go(egHandler(s, v))
 	}
-	err = eg.Wait()
+	err := eg.Wait()
 	if err != nil {
 		http.Error(w, fmt.Sprintf("An error was occured: %v", err), http.StatusInternalServerError)
 		return
@@ -132,6 +132,8 @@ func AddHandler(w http.ResponseWriter, r *http.Request) {
 	ctx := appengine.NewContext(r)
 
 	body, _ := ioutil.ReadAll(r.Body)
+	defer r.Body.Close()
+
 	item := &Item{}
 	err := json.Unmarshal(body, item)
 	if err != nil {
@@ -140,12 +142,6 @@ func AddHandler(w http.ResponseWriter, r *http.Request) {
 	}
 	if item.ID == "" {
 		http.Error(w, fmt.Sprintf("id is required"), http.StatusInternalServerError)
-		return
-	}
-
-	cli, err := datastore.NewClient(ctx, os.Getenv("GCLOUD_PROJECT"))
-	if err != nil {
-		http.Error(w, fmt.Sprintf("An error was occured: %v", err), http.StatusInternalServerError)
 		return
 	}
 
@@ -178,12 +174,6 @@ func FinishedHandler(w http.ResponseWriter, r *http.Request) {
 	}
 	if item.ID == "" {
 		http.Error(w, fmt.Sprintf("id is required"), http.StatusInternalServerError)
-		return
-	}
-
-	cli, err := datastore.NewClient(ctx, os.Getenv("GCLOUD_PROJECT"))
-	if err != nil {
-		http.Error(w, fmt.Sprintf("An error was occured: %v", err), http.StatusInternalServerError)
 		return
 	}
 
